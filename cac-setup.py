@@ -70,10 +70,19 @@ from typing import NamedTuple
 # ============================================================================
 
 # Most of this script runs under ``sudo`` (the cert install and the
-# ``--apply-crash-fix`` / ``--revert-crash-fix`` flags all need root). The two
-# user-level subcommands (``crash-fix`` and ``trace-locks``) instead run
-# as the normal user -- they only write into that user's home -- and refuse to
-# run under sudo (see ``require_user``).
+# ``--apply-crash-fix`` / ``--revert-crash-fix`` flags all need root -- they do
+# the cert install, which is root-only). But those flags don't do the crash-fix
+# work themselves: they re-invoke this script as the normal user (via
+# ``sudo -u``) to run the ``crash-fix`` subcommand, so the launchers it writes
+# land in -- and are owned by -- that user's home, not root's. See
+# ``apply_crash_fix`` / ``revert_crash_fix``.
+#
+# The user-level subcommands (``crash-fix`` and ``trace-locks``) are that
+# user-owned half on its own: they only write into the user's home, so they run
+# as the normal user and refuse to run under sudo (see ``require_user``). So the
+# crash fix always executes as the user -- whether you invoke ``crash-fix``
+# directly, or reach it through the root ``--apply-crash-fix`` wrapper, which
+# just bolts the root-only cert install onto the front.
 #
 # Resolve the *real* user for either case:
 #   * When we're root (euid 0) we were sudo'd, so the human is named by
