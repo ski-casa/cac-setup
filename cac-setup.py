@@ -832,7 +832,17 @@ CHROME_BIN = '/usr/bin/google-chrome-stable'
 # covers the whole family uniformly.
 _FIX_USER_APPS = ORIG_HOME / '.local/share/applications'
 _FIX_MARKER = 'X-Memlock-Fix=generated'
+_FIX_MARKER_INPLACE = 'X-Memlock-Fix=inplace'
 _FIX_WRAP = 'prlimit --memlock=0 --'
+# Browser-generated web-app (PWA) shortcuts, e.g. chrome-<appid>-Default.desktop.
+# These exec the browser binary directly, so a cold start through one bypasses the
+# wrapped browser .desktop entirely -- they must be wrapped too. The <prefix>-*-*
+# double-dash pattern avoids matching the browsers' own ids (google-chrome,
+# brave-browser, ...). NOTE: the browser rewrites these files when a web app
+# updates its name/icon, silently stripping the wrapper -- re-run fix-browsers
+# after installing or updating any web app.
+_FIX_PWA_GLOBS = ('chrome-*-*.desktop', 'brave-*-*.desktop', 'chromium-*-*.desktop',
+                  'msedge-*-*.desktop', 'opera-*-*.desktop', 'vivaldi-*-*.desktop')
 _FIX_SOURCE_DIRS = (
     Path('/usr/share/applications'),
     Path('/var/lib/snapd/desktop/applications'),
@@ -870,6 +880,39 @@ def _fix_wrap_override(src: Path) -> str:
     return '\n'.join(out) + '\n'
 
 
+def _fix_wrap_inplace(p: Path, dry: bool) -> bool:
+    """Wrap a browser-generated PWA shortcut's Exec lines in place. True if changed."""
+    text = p.read_text()
+    if _FIX_MARKER in text:  # a generated override we own, not a PWA shortcut
+        return False
+    out: list[str] = []
+    changed = False
+    for line in text.splitlines():
+        if line.startswith('Exec='):
+            cmd = line[len('Exec='):].strip()
+            if not cmd.startswith('prlimit'):
+                line = f'Exec={_FIX_WRAP} {cmd}'
+                changed = True
+        out.append(line)
+        if line.startswith('[Desktop') and _FIX_MARKER_INPLACE not in text:
+            out.append(_FIX_MARKER_INPLACE)
+    if changed and not dry:
+        p.write_text('\n'.join(out) + '\n')
+    return changed
+
+
+def _fix_unwrap_inplace(p: Path) -> None:
+    """Undo _fix_wrap_inplace: strip the marker lines and the prlimit prefix."""
+    out: list[str] = []
+    for line in p.read_text().splitlines():
+        if line == _FIX_MARKER_INPLACE:
+            continue
+        if line.startswith(f'Exec={_FIX_WRAP} '):
+            line = 'Exec=' + line[len(f'Exec={_FIX_WRAP} '):]
+        out.append(line)
+    p.write_text('\n'.join(out) + '\n')
+
+
 def _fix_update_db() -> None:
     subprocess.run(f'update-desktop-database {shlex.quote(str(_FIX_USER_APPS))} 2>/dev/null',
                    shell=True)
@@ -888,10 +931,15 @@ def cmd_browsers_crash_fix(argv: list[str]) -> None:
         removed = 0
         for p in _FIX_USER_APPS.glob('*.desktop'):
             try:
-                if _FIX_MARKER in p.read_text():
+                text = p.read_text()
+                if _FIX_MARKER in text:
                     p.unlink()
                     removed += 1
                     print(f'  removed {p}')
+                elif _FIX_MARKER_INPLACE in text:
+                    _fix_unwrap_inplace(p)
+                    removed += 1
+                    print(f'  unwrapped {p}')
             except OSError:
                 pass
         _fix_update_db()
@@ -910,6 +958,14 @@ def cmd_browsers_crash_fix(argv: list[str]) -> None:
         if not dry:
             dest.write_text(_fix_wrap_override(src))
         acted += 1
+    for pat in _FIX_PWA_GLOBS:
+        for p in sorted(_FIX_USER_APPS.glob(pat)):
+            try:
+                if _fix_wrap_inplace(p, dry):
+                    print(f'  web-app shortcut: {"would wrap" if dry else "wrapped"}  ({p.name})')
+                    acted += 1
+            except OSError:
+                pass
     if acted and not dry:
         _fix_update_db()
     if acted == 0:
