@@ -22,8 +22,12 @@ the fresh-system setup. See the "Browser memory-lock crash fix" section for deta
 What it does:
     1. Installs the packages needed for smartcard/CAC support (OpenSC, pcsc-lite,
        NSS ``certutil``/``modutil``, etc.) using the system package manager.
-    2. Downloads the DoD certificate bundle from militarycac.com and unpacks it
-       into ``/tmp/AllCerts``.
+    2. Downloads DISA's DoD PKCS#7 certificate bundle, verifies its signature
+       against the pinned DoD Root CA fingerprints, and unpacks one PEM per
+       (unexpired) CA into a private temp directory.
+    2b. Installs those CAs into the OS trust store (``update-ca-certificates`` /
+       ``update-ca-trust``) so curl, git, Python and OpenTofu also trust
+       DoD-signed hosts such as code.levelup.cce.af.mil (``--skip-system-trust``).
     3. For every browser NSS database found -- plus the shared ``~/.pki/nssdb``
        (created if absent), which non-browser NSS apps such as LibreOffice,
        poppler ``pdfsig`` and pyHanko also use -- registers the OpenSC PKCS#11
@@ -51,12 +55,15 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import configparser
+import hashlib
 import os
 import pwd
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -103,10 +110,29 @@ else:
     ORIG_USER = pwd.getpwuid(os.getuid()).pw_name
 ORIG_HOME = Path(pwd.getpwnam(ORIG_USER).pw_dir)
 
-# Where the DoD certificate bundle is downloaded and unpacked.
-CERT_URL = 'https://militarycac.com/maccerts/AllCerts.zip'
-ZIP_PATH = Path('/tmp/AllCerts.zip')
-CERT_DIR = Path('/tmp/AllCerts')
+# The DoD certificate bundle: DISA's "Certificates PKCS#7 - DoD" package, the authoritative
+# source (militarycac.com redistributes this same set). download_certs() verifies it the way
+# DISA's README says to, then unpacks one PEM per CA into CERT_DIR -- a private temp dir
+# created at run time, never a fixed, predictable path under /tmp (we run as root).
+CERT_URL = 'https://dl.dod.cyber.mil/wp-content/uploads/pki-pke/zip/unclass-certificates_pkcs7_DoD.zip'
+CERT_DIR: Path | None = None
+
+# SHA-256 fingerprints of the DoD Root CAs, as published by DISA (https://crl.disa.mil).
+# The bundle is trusted only if its signer chain ends in one of these. When DISA issues a
+# new root, add it here after checking the fingerprint against crl.disa.mil.
+DOD_ROOT_FINGERPRINTS = {
+    'DoD Root CA 3': 'B1:07:B3:3F:45:3E:55:10:F6:8E:51:31:10:C6:F6:94:4B:AC:C2:63:DF:01:37:F8:21:C1:B3:C2:F8:F8:63:D2',
+    'DoD Root CA 4': '55:9A:51:89:45:2B:13:F8:23:3F:00:22:36:3C:06:F2:6E:3C:51:7C:1D:4B:77:44:50:35:95:9D:F3:24:4F:74',
+    'DoD Root CA 5': '1F:4E:DE:9D:C2:A2:41:F6:52:1B:F5:18:42:4A:CD:49:EB:E8:44:20:E6:9D:AF:5B:AC:57:AF:1F:8E:E2:94:A9',
+    'DoD Root CA 6': '2A:5E:41:AC:A9:3D:F7:CC:49:6D:23:69:B7:A0:A0:37:04:5D:50:2F:1A:BA:AF:76:97:5F:C0:7C:66:60:CF:93',
+}
+
+# OS trust store (what curl, git, Python, OpenTofu etc. read -- browsers use NSS instead):
+# (anchors dir, subdir we own, required file extension, command that rebuilds the bundle).
+SYSTEM_TRUST = (
+    (Path('/usr/local/share/ca-certificates'), 'dod', '.crt', ('update-ca-certificates',)),    # Debian/Ubuntu
+    (Path('/etc/pki/ca-trust/source/anchors'), 'dod', '.pem', ('update-ca-trust', 'extract')),  # RHEL/Fedora/Amazon
+)
 
 # Common install locations of the OpenSC PKCS#11 module, in priority order.
 # Some distros ship it directly under the arch libdir, others only under a
@@ -140,10 +166,10 @@ FIREFOX_INI_CANDIDATES = (
 
 # Packages required for CAC support, keyed by package manager.
 PKG_SET = {
-    'apt': ['libpcsclite1', 'pcscd', 'libccid', 'libpcsc-perl', 'pcsc-tools', 'libnss3-tools', 'unzip', 'wget', 'opensc', 'python3-venv', 'zenity'],
-    'dnf': ['pcsc-lite', 'pcsc-lite-ccid', 'pcsc-tools', 'nss-tools', 'opensc', 'unzip', 'wget'],
-    'yum': ['pcsc-lite', 'pcsc-lite-ccid', 'pcsc-tools', 'nss-tools', 'opensc', 'unzip', 'wget'],
-    'zypper': ['ccid', 'pcsc-tools', 'mozilla-nss-tools', 'opensc', 'unzip', 'wget'],
+    'apt': ['libpcsclite1', 'pcscd', 'libccid', 'libpcsc-perl', 'pcsc-tools', 'libnss3-tools', 'openssl', 'unzip', 'wget', 'opensc', 'python3-venv', 'zenity'],
+    'dnf': ['pcsc-lite', 'pcsc-lite-ccid', 'pcsc-tools', 'nss-tools', 'openssl', 'opensc', 'unzip', 'wget'],
+    'yum': ['pcsc-lite', 'pcsc-lite-ccid', 'pcsc-tools', 'nss-tools', 'openssl', 'opensc', 'unzip', 'wget'],
+    'zypper': ['ccid', 'pcsc-tools', 'mozilla-nss-tools', 'openssl', 'opensc', 'unzip', 'wget'],
 }
 
 # Environment for child processes: never let apt prompt interactively.
@@ -287,6 +313,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--remove-pdf-signer', action='store_true',
                         help='Remove the CAC PDF signer (venv + script + launcher), then exit '
                              'without installing certs.')
+    parser.add_argument('--skip-system-trust', action='store_true',
+                        help='Do not install the DoD CAs into the OS trust store (the one curl, '
+                             'git, Python and OpenTofu use). Browser NSS databases are still updated.')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show more detailed progress messages')
     return parser.parse_args()
@@ -315,27 +344,115 @@ def install_packages() -> None:
     log('Package installation complete.')
 
 
-def download_certs() -> None:
-    """Download the DoD certificate bundle and unpack it into CERT_DIR.
+def _openssl(*args: str, data: str | None = None) -> str:
+    """Run an openssl subcommand and return stdout; raise on failure."""
+    proc = subprocess.run(('openssl', *args), input=data, capture_output=True, text=True)
+    if proc.returncode:
+        raise SystemExit(f'openssl {args[0]} failed: {proc.stderr.strip()}')
+    return proc.stdout
 
-    Files are extracted world-readable and chowned to the original user so the
-    later certutil import (run as that user) can read them.
+
+def _verified_bundle(root: Path) -> Path:
+    """Return the DoD .der.p7b inside the unpacked zip, after verifying it as DISA's README says.
+
+    1) The first cert of DoD_PKE_CA_chain.pem must be a DoD Root CA we pin by fingerprint.
+    2) The S/MIME signature on the .sha256 checksum list must verify against that chain.
+    3) The .der.p7b's SHA-256 must match the signed list.
+    Any mismatch aborts: a bundle we cannot verify installs nothing.
     """
+    folder = next(p for p in root.iterdir() if p.is_dir())
+    chain = folder / 'DoD_PKE_CA_chain.pem'
+    sig = next(folder.glob('*.sha256'))
+    p7b = next(p for p in folder.glob('*.der.p7b') if '_Root_CA_' not in p.name)
+
+    fp = _openssl('x509', '-in', str(chain), '-noout', '-fingerprint', '-sha256').split('=', 1)[1].strip()
+    root_name = next((n for n, f in DOD_ROOT_FINGERPRINTS.items() if f == fp), None)
+    if not root_name:
+        raise SystemExit(f'DoD bundle signer chain ends in an unknown root ({fp}); refusing to install.')
+
+    proc = subprocess.run(('openssl', 'smime', '-verify', '-inform', 'DER', '-in', str(sig), '-CAfile', str(chain)),
+                          capture_output=True, text=True)
+    if proc.returncode:
+        raise SystemExit('DoD bundle checksum list failed signature verification; refusing to install.')
+    signed = dict(reversed(line.split()) for line in proc.stdout.replace('\r', '').splitlines() if len(line.split()) == 2)
+    if signed.get(p7b.name) != hashlib.sha256(p7b.read_bytes()).hexdigest():
+        raise SystemExit(f'{p7b.name} does not match its signed checksum; refusing to install.')
+
+    log(f'DoD bundle {folder.name} verified (signed under {root_name}).')
+    return p7b
+
+
+def download_certs() -> None:
+    """Download DISA's DoD PKCS#7 bundle, verify it, and unpack one PEM per CA into CERT_DIR.
+
+    Expired CAs are dropped. Root files are named DoDRootN, the nicknames earlier
+    runs used, so re-running on an existing database imports nothing twice.
+    Files are world-readable and owned by the original user so the later
+    certutil import (run as that user) can read them.
+    """
+    global CERT_DIR
     if DRY_RUN:
-        log(f'[DRY RUN] Would download DoD certificates to {ZIP_PATH} and extract them to {CERT_DIR}.')
+        log(f'[DRY RUN] Would download and verify the DoD certificate bundle from {CERT_URL}.')
         return
-    log(f'Downloading DoD certificates to {ZIP_PATH}...')
-    ZIP_PATH.unlink(missing_ok=True)
-    urllib.request.urlretrieve(CERT_URL, ZIP_PATH)
-    CERT_DIR.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(ZIP_PATH) as z:
-        z.extractall(CERT_DIR)
-    for p in CERT_DIR.iterdir():
-        p.chmod(0o644)
+    CERT_DIR = Path(tempfile.mkdtemp(prefix='cac-setup-'))
+    log(f'Downloading the DoD certificate bundle from {CERT_URL}...')
+    zip_path = CERT_DIR / 'bundle.zip'
+    urllib.request.urlretrieve(CERT_URL, zip_path)
+    with zipfile.ZipFile(zip_path) as z:
+        try:
+            z.extractall(CERT_DIR, filter='data')  # refuse paths that escape CERT_DIR (3.12+)
+        except TypeError:
+            z.extractall(CERT_DIR)
+
+    pem = _openssl('pkcs7', '-inform', 'DER', '-in', str(_verified_bundle(CERT_DIR)), '-print_certs')
+    kept = expired = 0
+    for cert in re.findall(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\n', pem, re.S):
+        if subprocess.run(('openssl', 'x509', '-noout', '-checkend', '0'), input=cert,
+                          capture_output=True, text=True).returncode:
+            expired += 1
+            continue
+        cn = re.search(r'CN\s*=\s*([^,\n]+)', _openssl('x509', '-noout', '-subject', data=cert)).group(1).strip()
+        m = re.fullmatch(r'DoD Root CA (\d+)', cn)
+        (CERT_DIR / f'{"DoDRoot" + m.group(1) if m else cn}.cer').write_text(cert)
+        kept += 1
+
+    CERT_DIR.chmod(0o755)
+    for path in CERT_DIR.rglob('*'):
+        path.chmod(0o755 if path.is_dir() else 0o644)
+        shutil.chown(path, ORIG_USER, ORIG_USER)
     shutil.chown(CERT_DIR, ORIG_USER, ORIG_USER)
-    for p in CERT_DIR.rglob('*'):
-        shutil.chown(p, ORIG_USER, ORIG_USER)
-    log(f'Certificates unpacked into {CERT_DIR}.')
+    log(f'{kept} DoD CA certificates unpacked into {CERT_DIR} ({expired} expired ones dropped).')
+
+
+def install_system_trust() -> None:
+    """Install the DoD CAs into the OS trust store, one file per CA under a dod/ subdirectory.
+
+    Browsers trust through NSS (see import_certs); everything else -- curl, git,
+    Python, OpenTofu -- reads the bundle the distro builds from its anchors
+    directory, so without this step ``git clone`` from a DoD-signed GitLab fails.
+    """
+    for base, sub, ext, update in SYSTEM_TRUST:
+        if base.is_dir() and shutil.which(update[0]):
+            break
+    else:
+        log('No system CA anchors directory found; skipping the OS trust store.')
+        return
+    if DRY_RUN:
+        log(f'[DRY RUN] Would install the DoD CAs under {base / sub} and run: {" ".join(update)}')
+        return
+    dest = base / sub
+    dest.mkdir(mode=0o755, exist_ok=True)
+    changed = 0
+    for cert in sorted(CERT_DIR.glob('*.cer')):
+        target = dest / (cert.stem.replace(' ', '_') + ext)
+        data = cert.read_bytes()
+        if not target.exists() or target.read_bytes() != data:
+            target.write_bytes(data)
+            target.chmod(0o644)
+            changed += 1
+    if changed:
+        subprocess.run(update, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log(f'OS trust store: {changed} DoD CA file(s) added or updated under {dest}.')
 
 
 # ============================================================================
@@ -463,13 +580,7 @@ def import_certs(db: str) -> DBResult | None:
 
     if DRY_RUN:
         log(f'[DRY RUN] Would initialize or verify NSS database at {db}.')
-        certs = sorted(CERT_DIR.glob('*.cer'))
-        if certs:
-            for cert in certs:
-                nick = cert.stem.replace(' ', '_')
-                log(f'[DRY RUN] Would import {cert.name} as {nick} (trust {CERT_TRUST})')
-        else:
-            log(f'[DRY RUN] Would import certificate files from {CERT_DIR} if present.')
+        log(f'[DRY RUN] Would import every CA from the verified DoD bundle (trust {CERT_TRUST}).')
         log(f'[DRY RUN] Would register OpenSC module from {PKCS11_PATHS}.')
         return None
 
@@ -1426,6 +1537,8 @@ def main() -> None:
     ensure_pcscd()  # the smartcard daemon must be running to read the CAC
     connect_snap_firefox_pcscd()  # let a snap-confined Firefox reach pcscd
     download_certs()
+    if not args.skip_system_trust:
+        install_system_trust()
     init_firefox_profile()
     init_chrome_profile()
     ensure_pki_nssdb()  # create the shared ~/.pki/nssdb if a fresh machine lacks it
@@ -1479,6 +1592,8 @@ def main() -> None:
     if args.add_pdf_signer:
         install_pdf_signer()
 
+    if CERT_DIR:
+        shutil.rmtree(CERT_DIR, ignore_errors=True)
     log('Done.')
 
 

@@ -49,16 +49,20 @@ sudo'd (they write into your home and refuse to run as root).
 sudo python3 cac-setup.py
 ```
 
-Installs the smartcard packages (OpenSC, pcsc-lite, NSS tools, zenity), downloads the DoD
-certificate bundle from militarycac.com, registers the OpenSC PKCS#11 module, and imports the
-DoD trust anchors into each browser's NSS database **and the shared `~/.pki/nssdb`** (created
-if absent). Certs are imported with NSS trust **`CT,C,C`** so the same anchors validate CAC
+Installs the smartcard packages (OpenSC, pcsc-lite, NSS tools, zenity), downloads DISA's
+official DoD PKCS#7 certificate bundle and verifies it before use (the signer chain must end in
+a DoD Root CA pinned by SHA-256 fingerprint in the script, the signed checksum list must verify,
+and the bundle must match it), drops expired CAs, installs the CAs into the **OS trust store**
+(`update-ca-certificates` / `update-ca-trust`, so `curl`, `git`, Python and OpenTofu trust
+DoD-signed hosts such as `code.levelup.cce.af.mil`), registers the OpenSC PKCS#11 module, and
+imports the DoD trust anchors into each browser's NSS database **and the shared `~/.pki/nssdb`**
+(created if absent). Certs are imported with NSS trust **`CT,C,C`** so the same anchors validate CAC
 web login (SSL) **and** document/email signing (S/MIME + object signing). Re-running is safe
 and fast — it imports only missing certs and re-marks any left at an older SSL-only trust, so
 re-running an existing setup upgrades it for signing.
 
-Options: `--only-browsers a,b`, `--exclude-browsers a,b`, `--disable-login-smartcard`,
-`-v/--verbose`, `-n/--dry-run`. See `python3 cac-setup.py --help`.
+Options: `--only-browsers a,b`, `--exclude-browsers a,b`, `--skip-system-trust`,
+`--disable-login-smartcard`, `-v/--verbose`, `-n/--dry-run`. See `python3 cac-setup.py --help`.
 
 ---
 
